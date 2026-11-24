@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/tuneinsight/lattigo/v6/ring"
@@ -206,6 +208,8 @@ type CompressionReport struct {
 
 	FullPolys, CompPolys int // 당사자 1명 기준 환 원소 수
 	FullBytes, CompBytes int // 당사자 1명 기준 직렬화 바이트
+	// 당사자 1명 기준 이론 바이트 (원소 수 × N × ceil(logQ) / 8)
+	FullTheoryBytes, CompTheoryBytes float64
 
 	KeyGenTime, CompressTime, ReconstructTime time.Duration // 당사자 1명 평균
 	UpKeyTime                                 time.Duration // 당사자 1명 평균 (K−1 회 R 적용)
@@ -228,7 +232,16 @@ type EvalResult struct {
 // sigma = 0 이면 오차 없는 암호화로 정확한 등식 (잔차 0) 을 검사하고, 아니면 잔차 < Q/(2 q_max) 를 검사합니다.
 // depth 는 Up key 재귀 노이즈 측정 깊이 (K 미만이면 K 로 맞춤).
 func EvalKeyCompressionTest(testID int, sigma float64, depth int) (*CompressionReport, error) {
-	op, K, err := setup(testID)
+	sketch, ok := RecommendedSketch[testID]
+	if !ok {
+		return nil, fmt.Errorf("test_id %d 없음", testID)
+	}
+	return EvalKeyCompressionTestSketch(sketch, sigma, depth)
+}
+
+// EvalKeyCompressionTestSketch 는 임의의 sketch (K = MaxParties, d = Qlen) 로 EvalKeyCompressionTest 를 수행합니다.
+func EvalKeyCompressionTestSketch(sketch MKParamSketch, sigma float64, depth int) (*CompressionReport, error) {
+	op, K, err := setupSketch(sketch)
 	if err != nil {
 		return nil, err
 	}
@@ -287,6 +300,10 @@ func EvalKeyCompressionTest(testID int, sigma float64, depth int) (*CompressionR
 		return nil, err
 	}
 	rep.FullBytes, rep.CompBytes = len(fb), len(cb)
+	// 이론 크기: 환 원소 하나 = N 계수 × ceil(log2 Q) 비트 (Lattigo 직렬화는 RNS 성분마다 64비트를 씀)
+	polyBits := float64(rep.N) * math.Ceil(rep.LogQ)
+	rep.FullTheoryBytes = float64(rep.FullPolys) * polyBits / 8
+	rep.CompTheoryBytes = float64(rep.CompPolys) * polyBits / 8
 
 	// 3. 힌트 잔차, 원본 G_h 잔차
 	rep.HintU0, rep.HintHStar, rep.HintHDelta, rep.HintV = new(big.Int), new(big.Int), new(big.Int), new(big.Int)
@@ -429,6 +446,8 @@ func (rep *CompressionReport) String() string {
 		rep.FullPolys, rep.CompPolys, float64(rep.FullPolys)/float64(rep.CompPolys))
 	s += fmt.Sprintf("               직렬화: full %.2f MiB  comp %.2f MiB  (×%.2f)\n",
 		float64(rep.FullBytes)/(1<<20), float64(rep.CompBytes)/(1<<20), float64(rep.FullBytes)/float64(rep.CompBytes))
+	s += fmt.Sprintf("               이론(N·⌈logQ⌉ bit/원소): full %.2f MiB  comp %.2f MiB\n",
+		rep.FullTheoryBytes/(1<<20), rep.CompTheoryBytes/(1<<20))
 	s += fmt.Sprintf("[시간/당사자] KeyGen %v  Compress %v  UpKeys %v  Reconstruct(전체) %v\n",
 		rep.KeyGenTime, rep.CompressTime, rep.UpKeyTime, rep.ReconstructTime)
 	s += fmt.Sprintf("[힌트 잔차] U_0 %s  H_* %s  H_Δ %s  V_h %s\n",
@@ -464,4 +483,65 @@ func (rep *CompressionReport) String() string {
 	}
 	s += fmt.Sprintf("  InternalProduct 복호 %-23s %s\n", stat(rep.Orig.IPErr), stat(rep.Rec.IPErr))
 	return s
+}
+
+// ---------------- 파라미터 스윕용 CSV (신규) ----------------
+
+// CSVHeader 는 CSVRow 의 열 이름입니다. 잔차 열은 log2 값 (빈 칸 = 측정 전 실패, 0 잔차는 -inf 대신 0).
+const CSVHeader = "K,logN,d,logQ,log2_qmax,sigma,bound_log2," +
+	"full_polys,comp_polys,full_ser_MiB,comp_ser_MiB,full_theory_MiB,comp_theory_MiB," +
+	"hint_max_log2,rec_block_max_log2," +
+	"orig_extend_log2,rec_extend_log2,orig_ip_log2,rec_ip_log2,orig_ip_ok,rec_ip_ok," +
+	"keygen_ms,reconstruct_ms,error"
+
+func log2Cell(x *big.Int) string {
+	if x == nil {
+		return ""
+	}
+	if x.Sign() == 0 {
+		return "0"
+	}
+	f, _ := new(big.Float).SetInt(x).Float64()
+	return fmt.Sprintf("%.2f", math.Log2(f))
+}
+
+// CSVRow 는 리포트를 CSV 한 줄로 만듭니다. rep 이 nil (파라미터 생성 실패 등) 이어도 동작합니다.
+func (rep *CompressionReport) CSVRow(s MKParamSketch, sigma float64, err error) string {
+	errStr := ""
+	if err != nil {
+		errStr = strings.ReplaceAll(err.Error(), ",", ";")
+	}
+	logN := int(math.Log2(float64(s.M / 2)))
+	if rep == nil {
+		return fmt.Sprintf("%d,%d,%d,,,%g%s,%s", s.MaxParties, logN, s.Qlen, sigma, strings.Repeat(",", 17), errStr)
+	}
+	mib := func(x float64) string { return fmt.Sprintf("%.3f", x/(1<<20)) }
+	okStr := func(r EvalResult) string {
+		if r.IPNoise == nil {
+			return ""
+		}
+		return strconv.FormatBool(r.IPErr == nil)
+	}
+	var hint, recBlk *big.Int
+	if rep.HintU0 != nil {
+		hint = maxBig(rep.HintU0, rep.HintHStar, rep.HintHDelta, rep.HintV)
+	}
+	if rep.RecBlock != nil {
+		recBlk = maxBig(rep.RecBlock...)
+	}
+	boundLog2, _ := new(big.Float).SetInt(rep.Bound).Float64()
+	boundLog2 = math.Log2(boundLog2)
+	cols := []string{
+		strconv.Itoa(rep.K), strconv.Itoa(logN), strconv.Itoa(rep.Glen),
+		fmt.Sprintf("%.2f", rep.LogQ), fmt.Sprintf("%.2f", rep.LogQ-boundLog2-1), fmt.Sprintf("%g", sigma),
+		fmt.Sprintf("%.2f", boundLog2),
+		strconv.Itoa(rep.FullPolys), strconv.Itoa(rep.CompPolys),
+		mib(float64(rep.FullBytes)), mib(float64(rep.CompBytes)), mib(rep.FullTheoryBytes), mib(rep.CompTheoryBytes),
+		log2Cell(hint), log2Cell(recBlk),
+		log2Cell(rep.Orig.ExtendNoise), log2Cell(rep.Rec.ExtendNoise),
+		log2Cell(rep.Orig.IPNoise), log2Cell(rep.Rec.IPNoise), okStr(rep.Orig), okStr(rep.Rec),
+		strconv.FormatInt(rep.KeyGenTime.Milliseconds(), 10), strconv.FormatInt(rep.ReconstructTime.Milliseconds(), 10),
+		errStr,
+	}
+	return strings.Join(cols, ",")
 }

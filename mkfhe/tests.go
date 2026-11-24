@@ -16,6 +16,11 @@ func setup(testID int) (*MKOperator, int, error) {
 	if !ok {
 		return nil, 0, fmt.Errorf("test_id %d 없음", testID)
 	}
+	return setupSketch(sketch)
+}
+
+// setupSketch 는 임의의 sketch (K = MaxParties, d = Qlen) 로 연산기를 만듭니다 (신규, 파라미터 스윕용).
+func setupSketch(sketch MKParamSketch) (*MKOperator, int, error) {
 	params, err := NewMKParameters(sketch)
 	if err != nil {
 		return nil, 0, err
